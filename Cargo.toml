@@ -1,0 +1,18 @@
+[package]
+name = "toq-rs"
+version = "0.1.0"
+edition = "2024"
+description = "OSCQuery library and CLI sidecar — mDNS advertisement, HTTP serving, and service discovery for OSC applications"
+license = "MIT"
+repository = "https://github.com/rainy-aa/toq-rs"
+keywords = ["osc", "oscquery", "mdns", "vrchat"]
+categories = ["network-programming"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
+clap = { version = "4", features = ["derive"] }
+axum = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+mdns-sd = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
