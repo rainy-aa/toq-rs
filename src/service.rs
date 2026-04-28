@@ -52,11 +52,31 @@ impl OSCQueryService {
 
         let oscquery_props: HashMap<String, String> =
             [("txtvers".to_owned(), "1".to_owned())].into();
+        // Collect non-loopback IPv4 addresses on this host. We restrict to IPv4
+        // because many OSCQuery clients (notably VRChat) only follow A records, and
+        // mdns-sd's enable_addr_auto can publish link-local IPv6 that those clients ignore.
+        let host_ips = if_addrs::get_if_addrs()
+            .map(|addrs| {
+                addrs
+                    .into_iter()
+                    .filter(|a| !a.is_loopback() && matches!(a.ip(), std::net::IpAddr::V4(_)))
+                    .map(|a| a.ip().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_else(|_| String::new());
+        // Fall back to loopback if no LAN IPv4 was found; otherwise mdns-sd refuses to register.
+        let host_ips = if host_ips.is_empty() {
+            "127.0.0.1".to_owned()
+        } else {
+            host_ips
+        };
+
         let oscquery_info = ServiceInfo::new(
             "_oscjson._tcp.local.",
             name,
             &format!("{name}.local."),
-            "127.0.0.1",
+            host_ips.as_str(),
             http_port,
             Some(oscquery_props),
         )
@@ -70,7 +90,7 @@ impl OSCQueryService {
             "_osc._udp.local.",
             name,
             &format!("{name}.local."),
-            "127.0.0.1",
+            host_ips.as_str(),
             osc_port,
             Some(osc_props),
         )
@@ -133,8 +153,9 @@ async fn handle_request(
     request: axum::extract::Request,
 ) -> Response {
     let path = request.uri().path().to_owned();
+    let query = request.uri().query().unwrap_or("").to_owned();
 
-    if path.contains("HOST_INFO") {
+    if path.contains("HOST_INFO") || query.contains("HOST_INFO") {
         let json = serde_json::to_string(state.host_info.as_ref()).unwrap();
         return (
             StatusCode::OK,
