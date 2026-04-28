@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde::Serialize;
 use toq_rs::{
-    default_values_for_type_tags, get_open_tcp_port, get_open_udp_port, watch_oscquery_services,
-    DiscoveryEvent, OSCAccess, OSCQueryNode, OSCQueryService, OscValue,
+    default_values_for_type_tags, get_open_tcp_port, get_open_udp_port,
+    watch_oscquery_services_with_daemon, DiscoveryEvent, OSCAccess, OSCQueryNode, OSCQueryService,
+    OscValue, ServiceDaemon,
 };
 
 #[derive(Parser)]
@@ -83,7 +84,7 @@ fn parse_endpoint(spec: &str) -> Result<(String, String, OSCAccess), String> {
     Ok((path, type_tags, access))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     let cli = Cli::parse();
 
@@ -130,7 +131,25 @@ async fn main() {
         parsed_endpoints.push((path, values, access));
     }
 
-    let svc = match OSCQueryService::new(&cli.name, http_port, osc_port, &cli.osc_ip).await {
+    let mdns = match ServiceDaemon::new() {
+        Ok(d) => d,
+        Err(e) => {
+            emit(&Event::Error {
+                message: format!("Failed to create mDNS daemon: {e}"),
+            });
+            std::process::exit(1);
+        }
+    };
+
+    let svc = match OSCQueryService::with_daemon(
+        &cli.name,
+        http_port,
+        osc_port,
+        &cli.osc_ip,
+        mdns.clone(),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             emit(&Event::Error { message: e });
@@ -151,7 +170,7 @@ async fn main() {
         osc_port,
     });
 
-    let mut discovery_rx = match watch_oscquery_services() {
+    let mut discovery_rx = match watch_oscquery_services_with_daemon(mdns) {
         Ok(rx) => rx,
         Err(e) => {
             emit(&Event::Error {

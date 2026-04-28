@@ -1,10 +1,15 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use tokio::sync::mpsc;
 
 use crate::node::{OSCHostInfo, OSCQueryNode};
+
+fn shared_http_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(reqwest::Client::new)
+}
 
 /// Events emitted by the mDNS discovery watcher.
 #[derive(Debug, Clone)]
@@ -18,38 +23,48 @@ pub enum DiscoveryEvent {
     },
 }
 
-/// Start an event-driven mDNS watcher for `_oscjson._tcp.local.` services.
-///
-/// Returns a channel receiver that yields `DiscoveryEvent`s as services
-/// appear and disappear on the network.
+/// Start an event-driven mDNS watcher for `_oscjson._tcp.local.` services,
+/// returning a channel that yields `DiscoveryEvent`s.
 pub fn watch_oscquery_services() -> Result<mpsc::Receiver<DiscoveryEvent>, String> {
     let mdns = ServiceDaemon::new().map_err(|e| format!("Failed to create mDNS daemon: {e}"))?;
+    watch_oscquery_services_with_daemon(mdns)
+}
+
+/// Like `watch_oscquery_services` but reuses a caller-provided `ServiceDaemon`
+/// to avoid duplicate daemon threads.
+pub fn watch_oscquery_services_with_daemon(
+    mdns: ServiceDaemon,
+) -> Result<mpsc::Receiver<DiscoveryEvent>, String> {
     let receiver = mdns
         .browse("_oscjson._tcp.local.")
         .map_err(|e| format!("Failed to browse OSCQuery services: {e}"))?;
 
     let (tx, rx) = mpsc::channel(64);
 
-    std::thread::spawn(move || {
-        let _mdns = mdns;
-        while let Ok(event) = receiver.recv() {
-            let discovery = match event {
-                ServiceEvent::ServiceResolved(info) => Some(DiscoveryEvent::ServiceFound {
-                    fullname: info.get_fullname().to_owned(),
-                    info: Box::new(info),
-                }),
-                ServiceEvent::ServiceRemoved(_, fullname) => {
-                    Some(DiscoveryEvent::ServiceLost { fullname })
-                }
-                _ => None,
-            };
-            if let Some(evt) = discovery {
-                if tx.blocking_send(evt).is_err() {
+    std::thread::Builder::new()
+        .name("toq-mdns-watch".into())
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            let _mdns = mdns;
+            while let Ok(event) = receiver.recv() {
+                let discovery = match event {
+                    ServiceEvent::ServiceResolved(info) => Some(DiscoveryEvent::ServiceFound {
+                        fullname: info.get_fullname().to_owned(),
+                        info: Box::new(info),
+                    }),
+                    ServiceEvent::ServiceRemoved(_, fullname) => {
+                        Some(DiscoveryEvent::ServiceLost { fullname })
+                    }
+                    _ => None,
+                };
+                if let Some(evt) = discovery
+                    && tx.blocking_send(evt).is_err()
+                {
                     break; // receiver dropped
                 }
             }
-        }
-    });
+        })
+        .map_err(|e| format!("Failed to spawn watcher thread: {e}"))?;
 
     Ok(rx)
 }
@@ -63,8 +78,11 @@ pub struct OSCQueryBrowser {
 
 impl OSCQueryBrowser {
     pub fn new() -> Self {
-        let mdns = ServiceDaemon::new().expect("Failed to create mDNS daemon");
+        Self::with_daemon(ServiceDaemon::new().expect("Failed to create mDNS daemon"))
+    }
 
+    /// Construct a browser reusing a caller-provided `ServiceDaemon`.
+    pub fn with_daemon(mdns: ServiceDaemon) -> Self {
         let osc_services: Arc<Mutex<HashMap<String, ServiceInfo>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let oscjson_services: Arc<Mutex<HashMap<String, ServiceInfo>>> =
@@ -72,43 +90,51 @@ impl OSCQueryBrowser {
 
         let osc_receiver = mdns.browse("_osc._udp.local.").expect("Failed to browse OSC");
         let osc_svcs = osc_services.clone();
-        std::thread::spawn(move || {
-            while let Ok(event) = osc_receiver.recv() {
-                match event {
-                    ServiceEvent::ServiceResolved(info) => {
-                        osc_svcs
-                            .lock()
-                            .unwrap()
-                            .insert(info.get_fullname().to_owned(), info);
+        std::thread::Builder::new()
+            .name("toq-mdns-osc".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                while let Ok(event) = osc_receiver.recv() {
+                    match event {
+                        ServiceEvent::ServiceResolved(info) => {
+                            osc_svcs
+                                .lock()
+                                .unwrap()
+                                .insert(info.get_fullname().to_owned(), info);
+                        }
+                        ServiceEvent::ServiceRemoved(_, name) => {
+                            osc_svcs.lock().unwrap().remove(&name);
+                        }
+                        _ => {}
                     }
-                    ServiceEvent::ServiceRemoved(_, name) => {
-                        osc_svcs.lock().unwrap().remove(&name);
-                    }
-                    _ => {}
                 }
-            }
-        });
+            })
+            .expect("Failed to spawn OSC browser thread");
 
         let oscjson_receiver = mdns
             .browse("_oscjson._tcp.local.")
             .expect("Failed to browse OSCQuery");
         let oscjson_svcs = oscjson_services.clone();
-        std::thread::spawn(move || {
-            while let Ok(event) = oscjson_receiver.recv() {
-                match event {
-                    ServiceEvent::ServiceResolved(info) => {
-                        oscjson_svcs
-                            .lock()
-                            .unwrap()
-                            .insert(info.get_fullname().to_owned(), info);
+        std::thread::Builder::new()
+            .name("toq-mdns-oscjson".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                while let Ok(event) = oscjson_receiver.recv() {
+                    match event {
+                        ServiceEvent::ServiceResolved(info) => {
+                            oscjson_svcs
+                                .lock()
+                                .unwrap()
+                                .insert(info.get_fullname().to_owned(), info);
+                        }
+                        ServiceEvent::ServiceRemoved(_, name) => {
+                            oscjson_svcs.lock().unwrap().remove(&name);
+                        }
+                        _ => {}
                     }
-                    ServiceEvent::ServiceRemoved(_, name) => {
-                        oscjson_svcs.lock().unwrap().remove(&name);
-                    }
-                    _ => {}
                 }
-            }
-        });
+            })
+            .expect("Failed to spawn OSCQuery browser thread");
 
         Self {
             _mdns: mdns,
@@ -141,10 +167,10 @@ impl OSCQueryBrowser {
     pub async fn find_service_by_name(&self, name: &str) -> Option<ServiceInfo> {
         for svc in self.get_discovered_oscquery() {
             let client = OSCQueryClient::new(&svc);
-            if let Some(hi) = client.get_host_info().await {
-                if hi.name.contains(name) {
-                    return Some(svc);
-                }
+            if let Some(hi) = client.get_host_info().await
+                && hi.name.contains(name)
+            {
+                return Some(svc);
             }
         }
         None
@@ -205,7 +231,7 @@ impl OSCQueryClient {
     /// Query a node at the given OSC path.
     pub async fn query_node(&self, path: &str) -> Option<OSCQueryNode> {
         let url = format!("{}{}", self.base_url, path);
-        let resp = match reqwest::get(&url).await {
+        let resp = match shared_http_client().get(&url).send().await {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("Error querying node: {e}");
@@ -213,9 +239,6 @@ impl OSCQueryClient {
             }
         };
 
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return None;
-        }
         if !resp.status().is_success() {
             return None;
         }
@@ -226,7 +249,7 @@ impl OSCQueryClient {
     /// Get the HOST_INFO for this service.
     pub async fn get_host_info(&self) -> Option<OSCHostInfo> {
         let url = format!("{}/HOST_INFO", self.base_url);
-        let resp = reqwest::get(&url).await.ok()?;
+        let resp = shared_http_client().get(&url).send().await.ok()?;
         if !resp.status().is_success() {
             return None;
         }

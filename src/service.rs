@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Router;
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Router;
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use tokio::sync::RwLock;
 
@@ -13,7 +14,7 @@ use crate::node::{OSCAccess, OSCHostInfo, OSCQueryNode, OscValue};
 #[derive(Clone)]
 struct AppState {
     root_node: Arc<RwLock<OSCQueryNode>>,
-    host_info: Arc<OSCHostInfo>,
+    host_info_json: Bytes,
 }
 
 /// An OSCQuery service that advertises via mDNS and serves an HTTP API.
@@ -24,16 +25,31 @@ pub struct OSCQueryService {
 }
 
 impl OSCQueryService {
-    /// Create and start a new OSCQuery service.
-    ///
-    /// Registers mDNS services for `_oscjson._tcp.local.` and `_osc._udp.local.`,
-    /// and spawns an HTTP server on `http_port`.
-    pub async fn new(name: &str, http_port: u16, osc_port: u16, osc_ip: &str) -> Result<Self, String> {
+    /// Create and start a new OSCQuery service with mDNS registration and HTTP server.
+    pub async fn new(
+        name: &str,
+        http_port: u16,
+        osc_port: u16,
+        osc_ip: &str,
+    ) -> Result<Self, String> {
+        let mdns =
+            ServiceDaemon::new().map_err(|e| format!("Failed to create mDNS daemon: {e}"))?;
+        Self::with_daemon(name, http_port, osc_port, osc_ip, mdns).await
+    }
+
+    /// Like `new` but reuses a caller-provided `ServiceDaemon` with the service and watchers.
+    pub async fn with_daemon(
+        name: &str,
+        http_port: u16,
+        osc_port: u16,
+        osc_ip: &str,
+        mdns: ServiceDaemon,
+    ) -> Result<Self, String> {
         let root_node = Arc::new(RwLock::new(
             OSCQueryNode::new("/").with_description("root node"),
         ));
 
-        let mut extensions = HashMap::new();
+        let mut extensions = HashMap::with_capacity(5);
         extensions.insert("ACCESS".to_owned(), serde_json::Value::Bool(true));
         extensions.insert("CLIPMODE".to_owned(), serde_json::Value::Bool(false));
         extensions.insert("RANGE".to_owned(), serde_json::Value::Bool(true));
@@ -48,13 +64,15 @@ impl OSCQueryService {
             extensions,
         });
 
-        let mdns = ServiceDaemon::new().map_err(|e| format!("Failed to create mDNS daemon: {e}"))?;
+        // Pre-serialize HOST_INFO (immutable) to save per-request JSON encode + allocation.
+        let host_info_json = Bytes::from(
+            serde_json::to_vec(host_info.as_ref())
+                .map_err(|e| format!("Failed to serialize host info: {e}"))?,
+        );
 
-        let oscquery_props: HashMap<String, String> =
-            [("txtvers".to_owned(), "1".to_owned())].into();
-        // Collect non-loopback IPv4 addresses on this host. We restrict to IPv4
-        // because many OSCQuery clients (notably VRChat) only follow A records, and
-        // mdns-sd's enable_addr_auto can publish link-local IPv6 that those clients ignore.
+        let mut oscquery_props: HashMap<String, String> = HashMap::with_capacity(1);
+        oscquery_props.insert("txtvers".to_owned(), "1".to_owned());
+        // Collect non-loopback IPv4 only (VRChat and others ignore AAAA records).
         let host_ips = if_addrs::get_if_addrs()
             .map(|addrs| {
                 addrs
@@ -84,8 +102,8 @@ impl OSCQueryService {
         mdns.register(oscquery_info)
             .map_err(|e| format!("Failed to register OSCQuery service: {e}"))?;
 
-        let osc_props: HashMap<String, String> =
-            [("txtvers".to_owned(), "1".to_owned())].into();
+        let mut osc_props: HashMap<String, String> = HashMap::with_capacity(1);
+        osc_props.insert("txtvers".to_owned(), "1".to_owned());
         let osc_info = ServiceInfo::new(
             "_osc._udp.local.",
             name,
@@ -104,7 +122,7 @@ impl OSCQueryService {
 
         let state = AppState {
             root_node: root_node.clone(),
-            host_info: host_info.clone(),
+            host_info_json,
         };
 
         let app = Router::new().fallback(handle_request).with_state(state);
@@ -152,27 +170,27 @@ async fn handle_request(
     State(state): State<AppState>,
     request: axum::extract::Request,
 ) -> Response {
-    let path = request.uri().path().to_owned();
-    let query = request.uri().query().unwrap_or("").to_owned();
+    let uri = request.uri();
+    let path = uri.path();
+    let query = uri.query().unwrap_or("");
 
     if path.contains("HOST_INFO") || query.contains("HOST_INFO") {
-        let json = serde_json::to_string(state.host_info.as_ref()).unwrap();
         return (
             StatusCode::OK,
             [("content-type", "application/json")],
-            json,
+            state.host_info_json.clone(),
         )
             .into_response();
     }
 
     let root = state.root_node.read().await;
-    match root.find_subnode(&path) {
+    match root.find_subnode(path) {
         Some(node) => {
-            let json = serde_json::to_string(node).unwrap();
+            let body = serde_json::to_vec(node).unwrap_or_default();
             (
                 StatusCode::OK,
                 [("content-type", "application/json")],
-                json,
+                body,
             )
                 .into_response()
         }

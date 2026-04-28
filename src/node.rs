@@ -15,7 +15,8 @@ pub enum OSCAccess {
 }
 
 impl OSCAccess {
-    pub fn from_u8(v: u8) -> Option<Self> {
+    #[must_use]
+    pub const fn from_u8(v: u8) -> Option<Self> {
         match v {
             0 => Some(Self::NoValue),
             1 => Some(Self::ReadOnly),
@@ -39,7 +40,8 @@ pub enum OscValue {
 
 impl OscValue {
     /// Returns the OSC type tag character for this value.
-    pub fn type_tag(&self) -> char {
+    #[must_use]
+    pub const fn type_tag(&self) -> char {
         match self {
             OscValue::Int(_) => 'i',
             OscValue::Float(_) => 'f',
@@ -49,18 +51,45 @@ impl OscValue {
             OscValue::String(_) => 's',
         }
     }
+}
 
-    fn to_json_value(&self) -> serde_json::Value {
+impl Serialize for OscValue {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
         match self {
-            OscValue::Int(i) => serde_json::Value::from(*i),
-            OscValue::Float(f) => serde_json::Number::from_f64(*f as f64)
-                .map_or(serde_json::Value::Null, serde_json::Value::Number),
-            OscValue::Long(l) => serde_json::Value::from(*l),
-            OscValue::Double(d) => serde_json::Number::from_f64(*d)
-                .map_or(serde_json::Value::Null, serde_json::Value::Number),
-            OscValue::Bool(b) => serde_json::Value::from(*b),
-            OscValue::String(s) => serde_json::Value::from(s.as_str()),
+            OscValue::Int(i) => ser.serialize_i32(*i),
+            OscValue::Float(f) => {
+                if f.is_finite() {
+                    ser.serialize_f32(*f)
+                } else {
+                    ser.serialize_unit()
+                }
+            }
+            OscValue::Long(l) => ser.serialize_i64(*l),
+            OscValue::Double(d) => {
+                if d.is_finite() {
+                    ser.serialize_f64(*d)
+                } else {
+                    ser.serialize_unit()
+                }
+            }
+            OscValue::Bool(b) => ser.serialize_bool(*b),
+            OscValue::String(s) => ser.serialize_str(s),
         }
+    }
+}
+
+struct ContentsSer<'a>(&'a [OSCQueryNode]);
+
+impl Serialize for ContentsSer<'_> {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        let mut map = ser.serialize_map(None)?;
+        for node in self.0 {
+            if let Some(ref path) = node.full_path {
+                let key = path.rsplit_once('/').map_or(path.as_str(), |(_, k)| k);
+                map.serialize_entry(key, node)?;
+            }
+        }
+        map.end()
     }
 }
 
@@ -115,6 +144,7 @@ pub struct OSCQueryNode {
 }
 
 impl OSCQueryNode {
+    #[must_use]
     pub fn new(full_path: &str) -> Self {
         Self {
             full_path: Some(full_path.to_owned()),
@@ -126,22 +156,26 @@ impl OSCQueryNode {
         }
     }
 
+    #[must_use]
     pub fn with_description(mut self, desc: &str) -> Self {
         self.description = Some(desc.to_owned());
         self
     }
 
-    pub fn with_access(mut self, access: OSCAccess) -> Self {
+    #[must_use]
+    pub const fn with_access(mut self, access: OSCAccess) -> Self {
         self.access = Some(access);
         self
     }
 
+    #[must_use]
     pub fn with_value(mut self, value: Vec<OscValue>) -> Self {
         self.osc_type = Some(osc_type_to_tags(&value));
         self.value = Some(value);
         self
     }
 
+    #[must_use]
     pub fn with_osc_type(mut self, type_tags: &str) -> Self {
         self.osc_type = Some(type_tags.to_owned());
         self
@@ -254,25 +288,13 @@ impl Serialize for OSCQueryNode {
             map.serialize_entry("ACCESS", &(access as u8))?;
         }
         if let Some(ref value) = self.value {
-            let json_values: Vec<serde_json::Value> =
-                value.iter().map(OscValue::to_json_value).collect();
-            map.serialize_entry("VALUE", &json_values)?;
+            map.serialize_entry("VALUE", value)?;
         }
         if let Some(ref desc) = self.description {
             map.serialize_entry("DESCRIPTION", desc)?;
         }
         if let Some(ref contents) = self.contents {
-            let mut contents_map = serde_json::Map::new();
-            for node in contents {
-                if let Some(ref path) = node.full_path {
-                    let key = path.split('/').next_back().unwrap_or(path);
-                    contents_map.insert(
-                        key.to_owned(),
-                        serde_json::to_value(node).map_err(serde::ser::Error::custom)?,
-                    );
-                }
-            }
-            map.serialize_entry("CONTENTS", &contents_map)?;
+            map.serialize_entry("CONTENTS", &ContentsSer(contents))?;
         }
 
         map.end()
@@ -336,10 +358,10 @@ impl<'de> Deserialize<'de> for OSCQueryNode {
                                 parsed.clear();
                                 break;
                             }
-                            if let Some(tag) = tags.get(idx) {
-                                if let Some(parsed_val) = parse_value_with_tag(*tag, v) {
-                                    parsed.push(parsed_val);
-                                }
+                            if let Some(tag) = tags.get(idx)
+                                && let Some(parsed_val) = parse_value_with_tag(*tag, v)
+                            {
+                                parsed.push(parsed_val);
                             }
                         }
                         if parsed.is_empty() {
@@ -496,7 +518,7 @@ mod tests {
     fn test_node_serialization() {
         let node = OSCQueryNode::new("/test")
             .with_access(OSCAccess::ReadWrite)
-            .with_value(vec![OscValue::Int(42), OscValue::Float(3.14)])
+            .with_value(vec![OscValue::Int(42), OscValue::Float(2.5)])
             .with_description("a test node");
 
         let json = serde_json::to_value(&node).unwrap();
